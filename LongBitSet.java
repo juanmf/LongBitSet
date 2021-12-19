@@ -99,14 +99,18 @@ public class LongBitSet implements Cloneable, java.io.Serializable {
     /* use serialVersionUID from JDK 1.0.2 for interoperability */
     private static final long serialVersionUID = 7997698588986878753L;
 
+    public static LongBitSet getMaxSizeInstance() {
+        // Integer.MAX_VALUE - 3 << ADDRESS_BITS_PER_WORD
+        return new LongBitSet((long) 0b1111111_11111111_11111111_11111100_000000L);
+    }
+
     /**
      * Given a bit index, return word index containing it.
      */
     private static int wordIndex(long bitIndex) {
-        // TODO: Check that (int) here won't lose precision.
         long wordIndex = bitIndex >> ADDRESS_BITS_PER_WORD;
-        if (wordIndex > Integer.MAX_VALUE) {
-            throw new IndexOutOfBoundsException("Can't map bits to a bytes array, bit set too long: " + bitIndex);
+        if (wordIndex >= Integer.MAX_VALUE - 2) {
+            throw new IndexOutOfBoundsException("Can't map bits to a long array, bit set too long: " + bitIndex);
         }
         return (int) wordIndex;
     }
@@ -344,6 +348,9 @@ public class LongBitSet implements Cloneable, java.io.Serializable {
      * @param wordsRequired the minimum acceptable number of words.
      */
     private void ensureCapacity(int wordsRequired) {
+        if (wordsRequired >= Integer.MAX_VALUE - 2) {
+            throw new IndexOutOfBoundsException("Requested words exceeds JVM max array size: " + wordsRequired);
+        }
         if (words.length < wordsRequired) {
             // Allocate larger of doubled size or required size
             int request = Math.max(
@@ -362,7 +369,7 @@ public class LongBitSet implements Cloneable, java.io.Serializable {
      * @param wordIndex the index to be accommodated.
      */
     private void expandTo(int wordIndex) {
-        int wordsRequired = wordIndex+1;
+        int wordsRequired = wordIndex + 1;
         if (wordsInUse < wordsRequired) {
             ensureCapacity(wordsRequired);
             wordsInUse = wordsRequired;
@@ -637,6 +644,7 @@ public class LongBitSet implements Cloneable, java.io.Serializable {
      * is {@code true} if the bit with the index {@code bitIndex}
      * is currently set in this {@code LongBitSet}; otherwise, the result
      * is {@code false}.
+     * This implementation would also return false for bits beyond this LongBitSet size.
      *
      * @param  bitIndex   the bit index
      * @return the value of the bit with the specified index
