@@ -7,12 +7,21 @@ import java.io.*;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.LongBuffer;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.PrimitiveIterator;
 import java.util.Spliterator;
 import java.util.Spliterators;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ForkJoinPool;
+import java.util.stream.Collectors;
 import java.util.stream.LongStream;
+import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
 
 /**
@@ -69,6 +78,8 @@ public class LongBitSet implements Cloneable, java.io.Serializable {
             new ObjectStreamField("bits", long[].class),
     };
 
+    public static final long MAX_POSSIBLE_SIZE = 0b1111111_11111111_11111111_11111100_000000L;
+
     /**
      * The internal field corresponding to the serialField "bits".
      */
@@ -78,6 +89,12 @@ public class LongBitSet implements Cloneable, java.io.Serializable {
      * The number of words in the logical size of this LongBitSet.
      */
     private transient int wordsInUse = 0;
+
+    /**
+     * For sizeIsSticky scenarios, when using toString on sets that do not
+     * have many words used, it's impractical to iterate the whole array.
+     */
+    private transient int realWordsInUse = 0;
 
     /**
      * Whether the size of "words" is user-specified.  If so, we assume
@@ -101,7 +118,7 @@ public class LongBitSet implements Cloneable, java.io.Serializable {
 
     public static LongBitSet getMaxSizeInstance() {
         // Integer.MAX_VALUE - 3 << ADDRESS_BITS_PER_WORD
-        return new LongBitSet((long) 0b1111111_11111111_11111111_11111100_000000L);
+        return new LongBitSet(MAX_POSSIBLE_SIZE);
     }
 
     /**
@@ -145,7 +162,9 @@ public class LongBitSet implements Cloneable, java.io.Serializable {
             if (words[i] != 0)
                 break;
 
-        wordsInUse = i+1; // The new logical size
+        // The new logical size
+        wordsInUse = i+1;
+        realWordsInUse = i+1;
     }
 
     /**
@@ -186,6 +205,7 @@ public class LongBitSet implements Cloneable, java.io.Serializable {
     private LongBitSet(long[] words) {
         this.words = words;
         this.wordsInUse = words.length;
+        this.realWordsInUse = words.length;
         checkInvariants();
     }
 
@@ -373,6 +393,7 @@ public class LongBitSet implements Cloneable, java.io.Serializable {
         if (wordsInUse < wordsRequired) {
             ensureCapacity(wordsRequired);
             wordsInUse = wordsRequired;
+            realWordsInUse = wordsRequired;
         }
     }
 
@@ -453,6 +474,26 @@ public class LongBitSet implements Cloneable, java.io.Serializable {
 
         recalculateWordsInUse();
         checkInvariants();
+    }
+
+    /**
+     * Sets the bits from index 0 per boolean array passed.
+     *
+     * @param initialPattern
+     */
+    public void set(boolean[] initialPattern) {
+        set(initialPattern, 0L);
+    }
+
+    /**
+     * Sets the bits from index = offset per boolean array passed.
+     *
+     * @param initialPattern
+     */
+    public void set(boolean[] initialPattern, long offset) {
+        for(int i = 0 ; i < initialPattern.length; i++) {
+            set(i + offset, initialPattern[i]);
+        }
     }
 
     /**
@@ -637,6 +678,7 @@ public class LongBitSet implements Cloneable, java.io.Serializable {
 //        }
         while (wordsInUse > 0)
             words[--wordsInUse] = 0;
+        realWordsInUse = 0;
     }
 
     /**
@@ -711,6 +753,7 @@ public class LongBitSet implements Cloneable, java.io.Serializable {
 
         // Set wordsInUse correctly
         result.wordsInUse = targetWords;
+        result.realWordsInUse = targetWords;
         result.recalculateWordsInUse();
         result.checkInvariants();
 
@@ -933,13 +976,33 @@ public class LongBitSet implements Cloneable, java.io.Serializable {
         return sum;
     }
 
-    public long cardinalitySpace4ToString() {
-        long sum = 0;
-        for (int i = 0; i < wordsInUse; i++)
+    private long cardinalitySpace4ToString() {
+        long totalCharacters = 0;
+        long totalBitsSet = 0;
+        // Math.log10() works neatly but is more expensive.
+        int digits = 2;
+        long ticks = 100;
+        for (int i = 0; i < realWordsInUse; i++) {
+            int countInWord = Long.bitCount(words[i]);
+            ticks -= BITS_PER_WORD;
+            if (ticks <= 0) {
+                if (totalCharacters > Integer.MAX_VALUE - 3) {
+                    break;
+                }
+                digits++;
+                ticks = (long) Math.pow(10, digits);
+            }
             // Count bits times number of digits to write the index number.
-            sum += Long.bitCount(words[i]) * (Math.log10((long)i << ADDRESS_BITS_PER_WORD) + 1);
-
-        return sum;
+            if (countInWord != 0) {
+                totalBitsSet += countInWord;
+                totalCharacters += (2 + digits) * countInWord;
+            }
+        }
+        if (totalCharacters > Integer.MAX_VALUE - 3) {
+            throw new UnsupportedOperationException(
+                    "ToString not supported for LongBitSets representations larger than Integer.MAX_VALUE");
+        }
+        return totalBitsSet;
     }
 
     /**
@@ -954,9 +1017,14 @@ public class LongBitSet implements Cloneable, java.io.Serializable {
     public void and(LongBitSet set) {
         if (this == set)
             return;
-
-        while (wordsInUse > set.wordsInUse)
+        boolean checkRealWords = false;
+        while (wordsInUse > set.wordsInUse) {
+            checkRealWords = true;
             words[--wordsInUse] = 0;
+        }
+
+        if (checkRealWords && realWordsInUse > wordsInUse)
+            realWordsInUse = wordsInUse;
 
         // Perform logical AND on words in common
         for (int i = 0; i < wordsInUse; i++)
@@ -1000,6 +1068,7 @@ public class LongBitSet implements Cloneable, java.io.Serializable {
         if (wordsInUse < set.wordsInUse) {
             ensureCapacity(set.wordsInUse);
             wordsInUse = set.wordsInUse;
+            realWordsInUse = wordsInUse;
             if (sizeIsSticky) {
                 stickyLength = set.stickyLength != -1 ? set.stickyLength : wordsInUse * BITS_PER_WORD;
             }
@@ -1190,6 +1259,7 @@ public class LongBitSet implements Cloneable, java.io.Serializable {
         fields.put("stickyLength", stickyLength);
         fields.put("sizeIsSticky", sizeIsSticky);
         fields.put("wordsInUse", wordsInUse);
+        fields.put("realWordsInUse", realWordsInUse);
         s.writeFields();
     }
 
@@ -1206,6 +1276,7 @@ public class LongBitSet implements Cloneable, java.io.Serializable {
         stickyLength = fields.get("stickyLength", -1L);
         invariantsMet = false;
         wordsInUse = fields.get("wordsInUse", words.length);
+        wordsInUse = fields.get("realWordsInUse", words.length);
         checkInvariants();
     }
 
@@ -1235,13 +1306,8 @@ public class LongBitSet implements Cloneable, java.io.Serializable {
     public String toString() {
         checkInvariants();
         // Could overflow when nbits > Integer.MAX_VALUE
-        if (cardinalitySpace4ToString() > Integer.MAX_VALUE) {
-            throw new UnsupportedOperationException(
-                    "ToString not supported for LongBitSets representations larger than Integer.MAX_VALUE");
-        }
-
         int numBits = (wordsInUse > 128) ?
-                (int) cardinality() : wordsInUse * BITS_PER_WORD;
+                (int) cardinalitySpace4ToString() : wordsInUse * BITS_PER_WORD;
         StringBuilder b = new StringBuilder(6*numBits + 2);
         b.append('{');
 
@@ -1303,5 +1369,121 @@ public class LongBitSet implements Cloneable, java.io.Serializable {
                 Spliterator.SIZED | Spliterator.SUBSIZED |
                         Spliterator.ORDERED | Spliterator.DISTINCT | Spliterator.SORTED,
                 false);
+    }
+
+    /**
+     * Will copy the interval [repeatFrom, repeatTo] n times. From the index next to repeatTo.
+     *
+     * Repetitions are limited to {@link Integer::MAX_VALUE}
+     *
+     * @param repeatFrom
+     * @param repeatTo
+     * @param n
+     */
+    public void repeat(long repeatFrom, long repeatTo, int n) {
+        checkRange(repeatFrom, repeatTo);
+        long rangeSize = repeatTo - repeatFrom + 1;
+        if (n < 1) {
+            throw new IllegalArgumentException("Can't repeat less than 1 time");
+        }
+        if ((rangeSize) * n + repeatTo > MAX_POSSIBLE_SIZE) {
+            throw new IllegalStateException("Can't repeat interval beyond max size.");
+        }
+        if (shouldParallelizeRepeat(rangeSize, n)) {
+            repeatParallel(repeatFrom, repeatTo, n);
+        } else {
+            repeatSequential(repeatFrom, repeatTo, n);
+        }
+    }
+
+    private void repeatParallel(long repeatFrom, long repeatTo, int n) {
+        final long rangeSize = repeatTo - repeatFrom + 1;
+        Stream.iterate(1, i -> i + 1)
+                .limit(n)
+                .parallel()
+                .map(repetition -> repetition * rangeSize)
+                .forEach(offset -> copyRange(repeatFrom, repeatTo, offset));
+    }
+
+    /**
+     * TODO: can optimize by copying words, just handle edges correctly, see set(from, to).
+     * @param repeatFrom
+     * @param repeatTo
+     * @param offset
+     */
+    public void copyRange(long fromIndex, long toIndex, long offset) {
+
+        if (fromIndex == toIndex)
+            return;
+
+        // Increase capacity if necessary
+        int startWordIndex = wordIndex(fromIndex);
+        int endWordIndex   = wordIndex(toIndex - 1);
+        expandTo(endWordIndex);
+
+        long firstWordMask = words[startWordIndex] << fromIndex;
+        long lastWordMask  = words[endWordIndex] >>> -toIndex;
+
+        if (startWordIndex == endWordIndex) {
+            // Case 1: One word
+            for (long from = fromIndex; from <= toIndex; from++) {
+                set(from + offset, get(from));
+            }
+        } else {
+            // Case 2: Multiple words
+            // Handle first word
+            for (long from = fromIndex; wordIndex(from) == wordIndex(fromIndex); from++) {
+                set(from + offset, get(from));
+            }
+
+            int offsetWords = wordIndex(offset);
+            long toMask = WORD_MASK << offset;
+            long nextToMask = WORD_MASK >>> -offset;
+            // Handle intermediate words, if any
+            // | is cut point
+            // From: 000110 001001000100101001001000001
+            // To:   000000|000110001001000100101001001| To + 1: 000001|000000000000000000000000000
+            for (int i = startWordIndex + 1; i < endWordIndex; i++) {
+                long to = words[i + offsetWords];
+                long nextTo = words[1 + i + offsetWords];
+                words[i + offsetWords] |= words[i] >> -offset;
+
+            }
+
+            // Handle last word (restores invariants)
+            for (long to = toIndex; wordIndex(to) == wordIndex(toIndex); to--) {
+                set(to + offset, get(to));
+            }
+        }
+    }
+
+    private boolean shouldParallelizeRepeat(long rangeSize, int repetitions) {
+        // Arbitrary 10K words and 10 cycles.
+        return rangeSize > 640000 && repetitions > 10;
+    }
+
+    private void repeatSequential(long repeatFrom, long repeatTo, int n) {
+        long rangeSize = repeatTo - repeatFrom + 1;
+        long[] offsets = new long[n];
+        for (int repetition = 1; repetition <= n; repetition++) {
+            offsets[repetition - 1] = repetition * rangeSize;
+        }
+        // Noninclusive
+        // TODO: This should dbe compared with different strategies to assess memory pagination costs.
+        for(long offset : offsets) {
+            copyRange(repeatFrom, repeatTo, offset);
+        }
+    }
+
+    /**
+     * Use when the user needs the bit to clear to be set.
+     *
+     * @param l
+     * @throws IllegalArgumentException when bit not originally set.
+     */
+    public void clearOrBlowup(long l) {
+        if (! get(l))
+            throw new IllegalArgumentException("Bit was not set, nothing to clear: " + l);
+        clear(l);
     }
 }
