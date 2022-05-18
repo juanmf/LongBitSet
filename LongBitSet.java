@@ -7,19 +7,11 @@ import java.io.*;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.LongBuffer;
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.PrimitiveIterator;
 import java.util.Spliterator;
 import java.util.Spliterators;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ForkJoinPool;
-import java.util.stream.Collectors;
 import java.util.stream.LongStream;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
@@ -1403,6 +1395,7 @@ public class LongBitSet implements Cloneable, java.io.Serializable {
                 .parallel()
                 .map(repetition -> repetition * rangeSize)
                 .forEach(offset -> copyRange(repeatFrom, repeatTo, offset));
+        forceRecalculateWordsInUse();
     }
 
     /**
@@ -1413,13 +1406,9 @@ public class LongBitSet implements Cloneable, java.io.Serializable {
      */
     public void copyRange(long fromIndex, long toIndex, long offset) {
 
-        if (fromIndex == toIndex)
-            return;
-
         // Increase capacity if necessary
         int startWordIndex = wordIndex(fromIndex);
         int endWordIndex   = wordIndex(toIndex - 1);
-        expandTo(endWordIndex);
 
         long firstWordMask = words[startWordIndex] << fromIndex;
         long lastWordMask  = words[endWordIndex] >>> -toIndex;
@@ -1437,18 +1426,24 @@ public class LongBitSet implements Cloneable, java.io.Serializable {
             }
 
             int offsetWords = wordIndex(offset);
+            expandTo(endWordIndex + offsetWords + 1);
+
             long toMask = WORD_MASK << offset;
             long nextToMask = WORD_MASK >>> -offset;
             // Handle intermediate words, if any
             // | is cut point
-            // From: 000110 001001000100101001001000001
-            // To:   000000|000110001001000100101001001| To + 1: 000001|000000000000000000000000000
-            for (int i = startWordIndex + 1; i < endWordIndex; i++) {
-                long to = words[i + offsetWords];
-                long nextTo = words[1 + i + offsetWords];
-                words[i + offsetWords] |= words[i] >> -offset;
-
+            // From: 000110001001000100101001001000001
+            // To:   000000|001001000100101001001000001| To + 1: 000000000000000000000000000|000110
+            int i;
+            for (i = startWordIndex + 1; i < endWordIndex; i++) {
+                long to = words[i] << offset;
+                long nextTo = words[i]  >>> -offset;
+                words[i + offsetWords] |= to;
+                words[i + offsetWords + 1] |= nextTo;
             }
+            // TODO: fix -(toIndex + offset); bellow, |G| = 13 => |P| = 5772, should be 5760. To handle Last word,
+            //  add analogous strategy to 1st word
+            // words[i + offsetWords] &= WORD_MASK >>> -(toIndex + offset);
 
             // Handle last word (restores invariants)
             for (long to = toIndex; wordIndex(to) == wordIndex(toIndex); to--) {
@@ -1469,10 +1464,18 @@ public class LongBitSet implements Cloneable, java.io.Serializable {
             offsets[repetition - 1] = repetition * rangeSize;
         }
         // Noninclusive
-        // TODO: This should dbe compared with different strategies to assess memory pagination costs.
+        // TODO: This should be compared with different strategies to assess memory pagination costs.
         for(long offset : offsets) {
             copyRange(repeatFrom, repeatTo, offset);
         }
+    }
+
+    private void forceRecalculateWordsInUse() {
+        boolean sizeIsStickyVal = sizeIsSticky;
+        sizeIsSticky = false;
+        recalculateWordsInUse();
+        checkInvariants();
+        sizeIsSticky = sizeIsStickyVal;
     }
 
     /**
@@ -1481,7 +1484,7 @@ public class LongBitSet implements Cloneable, java.io.Serializable {
      * @param l
      * @throws IllegalArgumentException when bit not originally set.
      */
-    public void clearOrBlowup(long l) {
+    public void clearThrowIfAlreadyClear(long l) {
         if (! get(l))
             throw new IllegalArgumentException("Bit was not set, nothing to clear: " + l);
         clear(l);
